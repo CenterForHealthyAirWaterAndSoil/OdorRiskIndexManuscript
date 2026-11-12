@@ -1,0 +1,1170 @@
+"""
+odor_forecast_core.py - Core ORI model logic for the Calvert City Odor Risk Forecaster.
+
+This module is the single source of truth for:
+  - Model coefficients (Pittsburgh-trained + optional Calvert-fitted)
+  - ORI (Odor Risk Index) computation: logistic regression → 0–100% probability
+  - Wind alignment and distance-decay calculations
+  - Open-Meteo API fetches (forecast, historical, hourly)
+
+Imported by:
+  - generate_site.py  (CI pipeline, runs daily via GitHub Actions)
+  - analyze_calvert_reports.py  (local tool to retrain from Calvert data)
+  - scratch/test_*.py  (unit tests)
+
+The three production models:
+  COEFFS_PITTSBURGH          - Pittsburgh model, no spatial terms (baseline)
+  COEFFS_PITTSBURGH_PROXIMITY - Pittsburgh model + wind direction + distance decay
+  COEFFS_EST_CALVERT         - Manually estimated Calvert-specific coefficients
+  COEFFS_CALVERT_FITTED      - Auto-fitted from local Calvert reports (if enough data)
+
+To update coefficients: run Pittsburgh Data/Dual_Model_Proximity_Analysis.py from
+the repo root, review its output, then manually paste the new values below.
+"""
+import os
+import json
+import math
+import hashlib
+import datetime
+import numpy as np
+import pandas as pd
+import requests
+import sys
+import time
+
+# Open-Meteo access with retry. The daily GitHub Actions run on 2026-09-08 fell back to mock data
+# after a single transient failure (20 prior days succeeded; the same request worked locally minutes
+# later). Retry transient errors (connection/timeout, HTTP 429, HTTP 5xx) with exponential backoff
+# before giving up; other 4xx errors are real request problems and are raised immediately.
+OPEN_METEO_ATTEMPTS = 4
+OPEN_METEO_TIMEOUT_S = 40
+OPEN_METEO_BACKOFF_S = 3.0
+
+
+def fetch_open_meteo_json(url, attempts=OPEN_METEO_ATTEMPTS, timeout=OPEN_METEO_TIMEOUT_S):
+    """GET `url` and return parsed JSON, retrying transient failures with exponential backoff."""
+    last_exc = None
+    for attempt in range(1, attempts + 1):
+        try:
+            response = requests.get(url, timeout=timeout)
+            if response.status_code == 429 or response.status_code >= 500:
+                response.raise_for_status()
+            response.raise_for_status()
+            return response.json()
+        except requests.HTTPError as exc:
+            status = getattr(exc.response, "status_code", None)
+            if status is not None and status != 429 and status < 500:
+                raise
+            last_exc = exc
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            last_exc = exc
+        except requests.exceptions.JSONDecodeError as exc:
+            # HTTP 200 with an empty/non-JSON body is as transient as a 503 (2026-09-29).
+            last_exc = exc
+        if attempt < attempts:
+            delay = OPEN_METEO_BACKOFF_S * (2 ** (attempt - 1))
+            print(f"[open-meteo] attempt {attempt}/{attempts} failed ({last_exc!r}); retrying in {delay:.0f}s",
+                  file=sys.stderr)
+            time.sleep(delay)
+    raise last_exc
+
+
+def _report_fetch_failure(fn_name, exc):
+    print(f"[open-meteo] {fn_name}: all attempts failed, using mock fallback. Last error: {exc!r}",
+          file=sys.stderr)
+
+# Center coordinates of the Calvert City Industrial Complex
+IND_LAT = 37.0486
+IND_LON = -88.3480
+
+# Odor emission sources for the proximity model. The Calvert City complex is the
+# primary cluster; the TVA Shawnee Fossil Plant (West Paducah, ~10 mi NW of Paducah)
+# is a large coal SO2 emitter - SO2 is the same odorant proxy the Pittsburgh
+# validation used. Exposure uses the NEAREST source (see compute_multisource_terms):
+# a tract's risk is driven by whichever emitter it is closest to, decaying with
+# distance. This keeps exposure on the [0,1] scale the coefficient was calibrated on
+# (the validated single-source Calvert behavior) and adds a source's influence only
+# where that source is the closest one - it does not stack risk between sources.
+ODOR_SOURCES = [
+    {"name": "Calvert City Industrial Complex", "lat": IND_LAT, "lon": IND_LON},
+    {"name": "TVA Shawnee Fossil Plant",        "lat": 37.1533, "lon": -88.7739},
+]
+SOURCE_DECAY_K = 0.02  # exp(-k * distance_miles); matches the deployed proximity fit
+
+# Elevation-adjusted pressure offset (cross-city transfer correction):
+# Pittsburgh training mean surface pressure = 980.93 hPa (~370 m ASL);
+# Calvert City / western KY mean ≈ 998.3 hPa (~115 m ASL). Subtracting this offset
+# expresses Calvert pressure in Pittsburgh's training frame, preserving synoptic
+# anomaly signal while removing the elevation artifact.
+PRESSURE_ELEVATION_OFFSET = 17.4  # hPa
+
+# Surrounding study locations mapped to Census Tracts across Marshall, McCracken, and Livingston counties
+# GEOIDs are 11-digit 2020 Census Tract identifiers (STATE 2 + COUNTY 3 + TRACT 6)
+LOCATIONS = {
+    "TRACT 21139040100 (Tract Census Tract 401, Livingston Co.)": {"coords": (37.2777, -88.3421)},
+    "TRACT 21139040201 (Tract Census Tract 402.01, Livingston Co.)": {"coords": (37.0833, -88.4319)},
+    "TRACT 21139040202 (Tract Census Tract 402.02, Livingston Co.)": {"coords": (37.1057, -88.2843)},
+    "TRACT 21145030100 (Tract Census Tract 301, McCracken Co.)": {"coords": (37.0628, -88.5698)},
+    "TRACT 21145030200 (Tract Census Tract 302, McCracken Co.)": {"coords": (37.0706, -88.5938)},
+    "TRACT 21145030300 (Tract Census Tract 303, McCracken Co.)": {"coords": (37.0916, -88.5992)},
+    "TRACT 21145030400 (Tract Census Tract 304, McCracken Co.)": {"coords": (37.1041, -88.6260)},
+    "TRACT 21145030500 (Tract Census Tract 305, McCracken Co.)": {"coords": (37.0830, -88.6155)},
+    "TRACT 21145030600 (Tract Census Tract 306, McCracken Co.)": {"coords": (37.0611, -88.6107)},
+    "TRACT 21145030700 (Tract Census Tract 307, McCracken Co.)": {"coords": (37.0774, -88.6334)},
+    "TRACT 21145030800 (Tract Census Tract 308, McCracken Co.)": {"coords": (37.0724, -88.6556)},
+    "TRACT 21145030900 (Tract Census Tract 309, McCracken Co.)": {"coords": (37.0502, -88.6305)},
+    "TRACT 21145031000 (Tract Census Tract 310, McCracken Co.)": {"coords": (37.0332, -88.5806)},
+    "TRACT 21145031100 (Tract Census Tract 311, McCracken Co.)": {"coords": (37.0098, -88.5185)},
+    "TRACT 21145031200 (Tract Census Tract 312, McCracken Co.)": {"coords": (36.9868, -88.5832)},
+    "TRACT 21145031301 (Tract Census Tract 313.01, McCracken Co.)": {"coords": (37.0423, -88.6730)},
+    "TRACT 21145031302 (Tract Census Tract 313.02, McCracken Co.)": {"coords": (37.0211, -88.6825)},
+    "TRACT 21145031401 (Tract Census Tract 314.01, McCracken Co.)": {"coords": (37.1112, -88.6781)},
+    "TRACT 21145031402 (Tract Census Tract 314.02, McCracken Co.)": {"coords": (37.0651, -88.6984)},
+    "TRACT 21145031501 (Tract Census Tract 315.01, McCracken Co.)": {"coords": (37.1492, -88.8275)},
+    "TRACT 21145031502 (Tract Census Tract 315.02, McCracken Co.)": {"coords": (37.0609, -88.7955)},
+    "TRACT 21145031600 (Tract Census Tract 316, McCracken Co.)": {"coords": (36.9842, -88.7613)},
+    "TRACT 21157950101 (Tract Census Tract 9501.01, Marshall Co.)": {"coords": (37.0218, -88.4076)},
+    "TRACT 21157950102 (Tract Census Tract 9501.02, Marshall Co.)": {"coords": (37.0258, -88.3373)},
+    "TRACT 21157950200 (Tract Census Tract 9502, Marshall Co.)": {"coords": (36.9491, -88.4127)},
+    "TRACT 21157950300 (Tract Census Tract 9503, Marshall Co.)": {"coords": (36.9448, -88.2930)},
+    "TRACT 21157950400 (Tract Census Tract 9504, Marshall Co.)": {"coords": (36.8592, -88.3683)},
+    "TRACT 21157950501 (Tract Census Tract 9505.01, Marshall Co.)": {"coords": (36.8400, -88.4406)},
+    "TRACT 21157950502 (Tract Census Tract 9505.02, Marshall Co.)": {"coords": (36.7933, -88.3397)},
+    "TRACT 21157950601 (Tract Census Tract 9506.01, Marshall Co.)": {"coords": (36.8958, -88.2429)},
+    "TRACT 21157950602 (Tract Census Tract 9506.02, Marshall Co.)": {"coords": (36.8018, -88.2308)},
+    "TRACT 21157950603 (Tract Census Tract 9506.03, Marshall Co.)": {"coords": (36.8306, -88.1830)},
+}
+
+# Mean elevation (m) of each location's 0.25-degree ERA5 grid cell, as Open-Meteo reports it for
+# models=era5 with cell_selection=nearest&elevation=nan (the training panel's cell_elevation_m).
+# The live forecast is requested at this elevation, not downscaled to the point, so its temperature
+# and pressure are in the training weather's frame (decided 2026-10-27). Keyed by cell centre.
+ERA5_CELL_ELEVATION_M = {
+    (36.75, -88.50): 144.0,
+    (36.75, -88.25): 145.0,
+    (37.00, -88.75): 119.0,
+    (37.00, -88.50): 124.0,
+    (37.00, -88.25): 130.0,
+    (37.25, -88.75): 127.0,
+    (37.25, -88.25): 141.0,
+}
+
+
+def era5_cell_elevation(lat, lon):
+    """Elevation of the ERA5 cell holding (lat, lon); a KeyError means a new location needs its cell added."""
+    return ERA5_CELL_ELEVATION_M[(round(lat * 4) / 4, round(lon * 4) / 4)]
+
+
+def _elevation_param(locations):
+    return ",".join(str(era5_cell_elevation(*loc["coords"])) for loc in locations.values())
+
+
+# Mean ERA5 surface pressure (hPa) of each location's grid cell over the refit's training window (complete local
+# days, 2018-01-01 to 2026-06-05, Copernicus ERA5 time series). The refit scores pressure as the anomaly against
+# this mean (REFIT_PLAN.md s7), which takes the place of the old elevation offset. Built by
+# training/live_cell_pressure.py; keyed by cell centre like ERA5_CELL_ELEVATION_M.
+ERA5_CELL_PRESSURE_MEAN_HPA = {
+    (36.75, -88.50): 1000.469,
+    (36.75, -88.25): 1000.386,
+    (37.00, -88.75): 1003.330,
+    (37.00, -88.50): 1002.793,
+    (37.00, -88.25): 1002.128,   # the Calvert City monitors' cell; equals the reference used to score the refit
+    (37.25, -88.75): 1002.313,
+    (37.25, -88.25): 1000.760,
+}
+
+
+def era5_cell_pressure_mean(lat, lon):
+    """Mean ERA5 surface pressure of the cell holding (lat, lon); a KeyError means the cell needs adding."""
+    return ERA5_CELL_PRESSURE_MEAN_HPA[(round(lat * 4) / 4, round(lon * 4) / 4)]
+
+
+# Live forecast model: ECMWF IFS (about 9 km), the model family ERA5 comes from, one model for every variable
+# and every day. Open-Meteo's default blend splices a short-range US model onto GFS after about 2.5 days and
+# tracks ERA5's day-to-day BLH and rain much less closely at Calvert (decided 2026-10-27).
+FORECAST_MODEL = "ecmwf_ifs"
+FORECAST_DAYS = 15  # ECMWF's 16th day has only 13 hours, which would skew that day's means
+
+# Live requests ask Open-Meteo for UTC and convert here: with timezone=America/Chicago it applies one fixed
+# offset to the whole window, so every day after a daylight-saving change was shifted by an hour. A local day
+# has 23, 24 or 25 hours, and a daily value is kept only when its input has every one of them (decided 2026-10-27).
+LOCAL_TZ = "America/Chicago"
+
+
+def _local_today():
+    return pd.Timestamp.now(tz=LOCAL_TZ).strftime('%Y-%m-%d')
+
+
+def _shift_days(date, n):
+    return (pd.Timestamp(date) + pd.Timedelta(days=n)).strftime('%Y-%m-%d')
+
+
+def _hours_in_local_day(date):
+    start = pd.Timestamp(date, tz=LOCAL_TZ)
+    return int(((start + pd.DateOffset(days=1)) - start) / pd.Timedelta(hours=1))
+
+
+def _to_local(df):
+    """Hourly rows requested in UTC -> local time (with daylight saving), local date and hour."""
+    df = df.copy()
+    df['time'] = pd.to_datetime(df['time']).dt.tz_localize('UTC').dt.tz_convert(LOCAL_TZ)
+    df['date'] = df['time'].dt.strftime('%Y-%m-%d')
+    return df
+
+
+def _short_days(hourly, col):
+    """Local dates on which `col` is missing any hour."""
+    n = hourly.groupby('date')[col].count()
+    return {d for d, k in n.items() if k != _hours_in_local_day(d)}
+
+
+def _blank_short_days(daily, hourly, sources):
+    """Set daily values to NaN on days their hourly input is incomplete. sources: {hourly col: [daily cols]}."""
+    for col, outs in sources.items():
+        daily.loc[daily['date'].isin(_short_days(hourly, col)), outs] = np.nan
+    return daily
+
+
+# Hourly input behind each daily column the daily fetchers build (wind_u/wind_v become wind_direction).
+DAILY_SOURCES = {
+    'temperature_2m': ['temperature', 'temp_min', 'temp_max'],
+    'rain': ['precipitation'],
+    'wind_speed_10m': ['wind_speed', 'wind_u', 'wind_v'],
+    'wind_direction_10m': ['wind_u', 'wind_v'],
+    'relative_humidity_2m': ['relative_humidity'],
+    'surface_pressure': ['atmospheric_pressure'],
+    'shortwave_radiation': ['solar_radiation'],
+    'boundary_layer_height_ft': ['boundary_layer_height'],
+}
+
+
+COEFFS_PITTSBURGH = {
+    'const': 3.559257,
+    'temperature': 0.127472,
+    'temperature_squared': -0.000564,
+    'solar_radiation': -0.016272,
+    'relative_humidity': -0.049634,
+    'wind_speed': -0.173865,
+    'precipitation': -0.908541,
+    'diurnal_temperature_range': 0.241257,
+    'boundary_layer_height': -0.000282,
+    'atmospheric_pressure': -0.005154,
+}
+
+COEFFS_EST_CALVERT = {
+    'const': 18.000000,             # manual offset for Calvert terrain
+    'temperature': 0.127472,
+    'temperature_squared': -0.000564,
+    'solar_radiation': -0.016272,
+    'relative_humidity': -0.049634,
+    'wind_speed': -0.150000,        # manual override (stronger rural sensitivity)
+    'precipitation': -0.908541,
+    'diurnal_temperature_range': 0.241257,
+    'boundary_layer_height': -0.000600,  # manual override (stronger rural sensitivity)
+    'atmospheric_pressure': -0.005154,
+}
+
+# Pittsburgh proximity-enhanced logit coefficients (zip-day panel, 2018-2026, 36 596 obs).
+# Temporal dummies (dow_*, is_holiday) excluded - zeroed for de-biased Calvert City predictions.
+# Proximity terms are integrated regression coefficients, not post-hoc multipliers:
+#   multi_source_exposure: applied to exp(-0.02 * distance_from_source)  [single source for Calvert]
+#   wind_align_weighted:   applied to continuous cosine alignment factor (0–1)
+# ΔAIC vs weather-only = -956, ΔPseudo-R² = +0.020 (both features p < 0.0001).
+#
+# PRECIPITATION OVERRIDE: the raw zip-day panel fit produced precipitation = +6.25265, an
+# overfitting artifact (each inch of rain → ~510x odds, physically backwards - rain scavenges
+# odor). On heavy-rain days this term alone reached z = +14, saturating ORI to 100%.
+# We override it with the empirically-validated city-wide Pittsburgh value (-0.908541), which
+# is physically correct. This is SAFE: precip is 0 on most days, so dry-day baseline calibration
+# (the jointly-fit intercept) is untouched; only rainy-day behavior changes. Raw value preserved
+# in the notebooks / model_coeffs_pittsburgh.json.
+#   NOT arbitrary and NOT removable: a controlled re-fit of the city-wide daily model
+#   (burden-above-mean target) reproduces this value to within rounding (raw fit ≈ -0.96),
+#   so the override simply substitutes the panel's overfit artifact with the model's own
+#   validated coefficient. Deleting it would reinstate the +6.25 artifact and re-break rainy
+#   days. The same substitution is applied to every proximity model (incl. the pooled one).
+_PROX_PRECIP_RAW = 6.252656147133751  # raw zip-day panel fit (kept for reference, NOT used)
+COEFFS_PITTSBURGH_PROXIMITY = {
+    'const': -16.225190,
+    'temperature': 0.010511,
+    'temperature_squared': -0.000140,
+    'solar_radiation': -0.000990,
+    'relative_humidity': 0.003887,
+    'wind_speed': -0.044421,
+    'precipitation': -0.908541,  # overridden from +6.253 (see note above)
+    'diurnal_temperature_range': 0.243231,
+    'boundary_layer_height': -5.688525e-05,
+    'atmospheric_pressure': 0.008638,
+    'multi_source_exposure': 1.727589,
+    'wind_align_weighted': 1.377858,
+}
+
+# POOLED (Pittsburgh + Louisville) proximity-enhanced coefficients.
+# Fit on both cities' zip-day panels stacked together via the exact same pipeline as
+# COEFFS_PITTSBURGH_PROXIMITY (burden-above-mean event, precip summed daily, dow/holiday
+# de-biasing, summed multi-source exposure), with a Louisville city dummy absorbing the
+# base-rate difference (dropped at deployment, so `const` stays in the Pittsburgh frame).
+# Precipitation is fitted, not overridden. The pre-audit pooled version (2026-07-27) replaced its
+# raw fit (+5.83) with the city-wide override; the leak-free rebuild below fits rain itself (-0.139).
+#
+# EQUAL-CITY WEIGHTING: Pittsburgh has ~9x Louisville's data; each city is weighted to equal
+# total influence so the fit is genuinely two-city, not Pittsburgh-dominated.
+#
+# ===================================================================================
+# HONEST / LEAK-FREE REBUILD (supersedes the earlier version of these coefficients).
+# A pipeline audit found the original training panel aggregated weather over only the hours
+# that had an odor report (median 1 hour/day). That made "diurnal temperature range" the
+# spread across those report-hours - effectively a proxy for the NUMBER of reports, i.e. the
+# outcome. It leaked: report-hour DTR correlated 0.63 with the event (true daily DTR only
+# 0.19); the report-count alone predicted the event at AUC 0.95; removing that one feature
+# collapsed the reported model from 0.90 to 0.64. The old ~0.90 was leakage, not skill, and it
+# also made the live tool run hot (the inflated DTR coefficient, applied to true 24-hour DTR,
+# was ~4-5x too large).
+#
+# These coefficients are refit on leak-free, fully-forecastable features:
+#   * true daily aggregates (24-hour means; true daily diurnal range) - what the live forecast
+#     actually feeds;
+#   * NEAREST-source proximity (max exp(-0.02·d)) in BOTH training and deployment, so the
+#     feature is on one consistent 0-1 scale (this also fixes the Calvert calibration collapse
+#     the summed-3-source training caused);
+#   * same event (weighted burden above its mean, ~23.8% base rate), pooled two-city, equal-weighted.
+# Honest cross-validated skill: AUC ~0.69 (logistic). On a NEW city (cross-city transfer proxy
+# for Calvert) skill is only ~0.6 - this is a relative indicator, not a precision instrument.
+# Validated on Calvert's own VOC monitors it still beats the old model (AUC 0.70 residential),
+# and tracks vinyl chloride - Calvert's signature emission - best (AUC 0.71).
+# F1-optimal alert threshold on this scale: 0.2113 (see model_metrics.json / ad_config).
+COEFFS_POOLED_PROXIMITY = {
+    'const': -11.361227,
+    'temperature': 0.064712,
+    'temperature_squared': -0.000431,
+    'solar_radiation': -0.004010,
+    'relative_humidity': -0.024127,
+    'wind_speed': -0.065999,
+    'precipitation': -0.138895,
+    'diurnal_temperature_range': 0.040744,   # true daily DTR (de-leaked; was 0.304 on report-hour DTR)
+    'boundary_layer_height': -0.000040,
+    'atmospheric_pressure': 0.002480,
+    'multi_source_exposure': 8.042405,        # nearest-source 0-1 scale (was 2.52 on summed 0-3 scale)
+    'wind_align_weighted': 0.640750,
+}
+
+# THE LIVE MODEL SINCE 2026-11-11: the 2026 refit (training/fit_refit.py under the frozen REFIT_PLAN.md, fit
+# 2026-10-28; outputs in training_panel_v2/fit/). It replaces COEFFS_POOLED_PROXIMITY, whose training weather mixed
+# sources and stored boundary layer height on the wrong scale. The refit's panel uses one Copernicus ERA5 source per
+# variable on every date (BLH in true feet, rain from Open-Meteo ERA5), every zip day of 107 Pittsburgh and
+# 36 Louisville zip codes (Louisville from 2019-03-01), equal total weight per city, an event of burden above the
+# city mean (value-1 "just fine" reports excluded), city x year intercepts, and day-of-week and holiday terms.
+# This is its deployment form (results.json "deployment_form"): raw-temperature coefficients, and const = the
+# equal-weight mean of the two cities' 2025 intercepts plus the average weekday and holiday effect. Pressure
+# enters as the anomaly against the location's own ERA5-cell mean (ERA5_CELL_PRESSURE_MEAN_HPA), so there is no
+# elevation offset. Alert line: the pooled F1-optimal threshold 0.1479 (model_metrics.json "refit").
+COEFFS_REFIT = {
+    'const': -12.292577416283653,
+    'temperature': 0.043055837674268814,
+    'temperature_squared': -0.0002703032157009063,
+    'diurnal_temperature_range': 0.04116573939372179,
+    'relative_humidity': -0.01057117328709091,
+    'wind_speed': -0.039563773907651256,
+    'boundary_layer_height': -0.00020099179687059626,
+    'solar_radiation': -0.002940997310868122,
+    'precipitation': -0.2461532330400102,
+    'pressure_anomaly': -0.005427796963419984,
+    'multi_source_exposure': 10.28591501734628,
+    'wind_align_weighted': 0.6714713385700173,
+}
+
+# Calvert City Proximity-Enhanced: Calvert terrain-adjusted weather coefficients
+# (stronger wind_speed / boundary_layer_height sensitivity for flat rural terrain)
+# combined with Pittsburgh's empirically trained proximity regression terms.
+COEFFS_CALVERT_PROXIMITY = {
+    **COEFFS_EST_CALVERT,
+    'multi_source_exposure': COEFFS_PITTSBURGH_PROXIMITY['multi_source_exposure'],
+    'wind_align_weighted': COEFFS_PITTSBURGH_PROXIMITY['wind_align_weighted'],
+}
+
+# Hourly case-crossover model, produced by Dual_Model_Proximity_Analysis.py Section 8.
+# Features: temperature/temperature_squared/BLH/wind_speed/rh/pressure/precipitation.
+# No intercept - at inference the z-values are anchored to the calibrated daily ORI.
+HOURLY_MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "model_coeffs_hourly.json")
+COEFFS_HOURLY = None
+HOURLY_MODEL_META = None
+if os.path.exists(HOURLY_MODEL_PATH):
+    try:
+        with open(HOURLY_MODEL_PATH) as _hh:
+            _hourly_json = json.load(_hh)
+        COEFFS_HOURLY = {k: float(v) for k, v in _hourly_json["coefficients"].items()}
+        HOURLY_MODEL_META = {k: v for k, v in _hourly_json.items() if k != "coefficients"}
+    except Exception:
+        COEFFS_HOURLY = None
+        HOURLY_MODEL_META = None
+
+
+# Optional locally-fitted Calvert City model, produced by analyze_calvert_reports.py
+# once enough real reports exist. The file is written ONLY when the analyst accepts an
+# install prompt; if present it is exposed in the dashboard as an extra mode. Its
+# const is pre-adjusted for the global PRESSURE_ELEVATION_OFFSET so it drops into the
+# same prediction path as the other models.
+FITTED_MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "calvert_fitted_model.json")
+COEFFS_CALVERT_FITTED = None
+CALVERT_FITTED_META = None
+if os.path.exists(FITTED_MODEL_PATH):
+    try:
+        with open(FITTED_MODEL_PATH) as _fh:
+            _fitted = json.load(_fh)
+        COEFFS_CALVERT_FITTED = {k: float(v) for k, v in _fitted["coefficients"].items()}
+        CALVERT_FITTED_META = {k: v for k, v in _fitted.items() if k != "coefficients"}
+    except Exception:
+        COEFFS_CALVERT_FITTED = None
+        CALVERT_FITTED_META = None
+
+
+def calculate_bearing(lat2, lon2):
+    lat1, lon1 = IND_LAT, IND_LON
+    dy = lat2 - lat1
+    dx = (lon2 - lon1) * math.cos(math.radians(lat1))
+    bearing = math.degrees(math.atan2(dx, dy))
+    return (bearing + 360) % 360
+
+
+def calculate_distance(lat2, lon2):
+    """Calculates the distance in miles from the industrial complex using the Haversine formula."""
+    lat1, lon1 = IND_LAT, IND_LON
+    R = 3958.8  # Earth radius in miles
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    delta_phi = math.radians(lat2 - lat1)
+    delta_lambda = math.radians(lon2 - lon1)
+
+    a = math.sin(delta_phi / 2.0)**2 + math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2.0)**2
+    c = 2.0 * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
+    return R * c
+
+
+def compute_continuous_wind_alignment(wind_from_deg, bearing_deg):
+    """
+    Returns a continuous wind alignment factor (0 to 1).
+
+    1.0 = wind blows perfectly FROM the source TOWARD the receiver (ideal transport)
+    0.0 = wind blows away from receiver (no transport)
+    0.5 = crosswind (perpendicular)
+
+    wind_from_deg: meteorological wind direction (direction wind comes FROM)
+    bearing_deg: bearing from emission source to receiver location
+    """
+    wind_toward = (wind_from_deg + 180) % 360
+    angle_diff = math.radians(wind_toward - bearing_deg)
+    return (1 + math.cos(angle_diff)) / 2
+
+
+def _pair_distance_miles(lat1, lon1, lat2, lon2):
+    """Haversine distance in miles between two arbitrary points."""
+    R = 3958.8
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlam = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2.0)**2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2.0)**2
+    return R * 2.0 * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
+
+
+def _source_bearing(src_lat, src_lon, recv_lat, recv_lon):
+    """Bearing (deg) FROM an emission source TO a receiver location."""
+    dy = recv_lat - src_lat
+    dx = (recv_lon - src_lon) * math.cos(math.radians(src_lat))
+    return (math.degrees(math.atan2(dx, dy)) + 360) % 360
+
+
+def compute_multisource_terms(lat, lon, wind_from_deg, sources=None, k=SOURCE_DECAY_K):
+    """Nearest-source exposure and that source's wind alignment for a location.
+
+    exposure   = max_i exp(-k · d_i)      (the dominant/nearest source; stays in [0,1])
+    alignment  = align for that same nearest source
+
+    where d_i is miles to source i. Using the nearest source (rather than summing
+    across all sources) keeps exposure on the [0,1] scale the multi_source_exposure
+    coefficient was calibrated on and avoids inflating risk for tracts sitting between
+    emitters: a tract's risk is driven by whichever source it is closest to, decaying
+    with distance. Adding a source raises a tract's exposure only where that source is
+    the closest one, leaving tracts nearer another source unchanged.
+    """
+    if sources is None:
+        sources = ODOR_SOURCES
+    best_w = 0.0
+    best_align = 0.5
+    for s in sources:
+        d = _pair_distance_miles(lat, lon, s["lat"], s["lon"])
+        w = math.exp(-k * d)
+        if w > best_w:
+            best_w = w
+            best_align = compute_continuous_wind_alignment(
+                wind_from_deg, _source_bearing(s["lat"], s["lon"], lat, lon))
+    return best_w, best_align
+
+
+# Sector bounds derived from calvert_zips.geojson via scratch/test_sectors.py;
+# regenerate them if the geojson boundaries change.
+def check_wind_alignment(wind_from, location_or_bearing, tolerance=10.0):
+    # Fallback to centroid math if a bearing is passed directly (useful for tests/compat)
+    if isinstance(location_or_bearing, (int, float)):
+        opposite_bearing = (location_or_bearing + 180) % 360
+        diff = abs(wind_from - opposite_bearing)
+        diff = min(diff, 360.0 - diff)
+        return diff <= 45.0  # Use default 45 degree tolerance for centroid math
+
+    # Sector check for ZIP codes
+    loc = str(location_or_bearing)
+    if "42029" in loc:      # Calvert City residential center
+        start, end = 150.0, 240.0
+    elif "42025" in loc:    # Benton
+        start, end = 132.1, 241.6
+    elif "42045" in loc:    # Grand Rivers
+        start, end = 26.9, 127.8
+    elif "42081" in loc:    # Smithland
+        start, end = 269.0, 58.5
+    elif "42058" in loc:    # Ledbetter
+        start, end = 256.3, 331.1
+    elif "42001" in loc:    # Paducah
+        start, end = 247.9, 288.6
+    elif "42003" in loc:    # Reidland
+        start, end = 230.0, 287.8
+    else:
+        return False
+
+    # Expand sector by tolerance (incoming wind blows FROM opposite directions)
+    # The wind direction (blows FROM) carrying odor is the opposite of the bearing sector:
+    incoming_start = (start + 180) % 360
+    incoming_end = (end + 180) % 360
+
+    # We want to check if wind_from falls in [incoming_start - tolerance, incoming_end + tolerance]
+    h_start = (incoming_start - tolerance) % 360
+    h_end = (incoming_end + tolerance) % 360
+
+    # Check if wind_from is inside this range
+    if h_start <= h_end:
+        return h_start <= wind_from <= h_end
+    else:
+        return wind_from >= h_start or wind_from <= h_end
+
+
+def get_risk_meta(ori):
+    if ori < 15.0:
+        return "Clear / Low Risk", "badge-clear", [22, 163, 74]
+    elif ori < 30.0:
+        return "Moderate Risk", "badge-moderate", [202, 138, 4]
+    elif ori < 50.0:
+        return "Elevated Risk", "badge-elevated", [234, 88, 12]
+    else:
+        return "High Risk", "badge-high", [220, 38, 38]
+
+
+def pressure_anomaly(row):
+    """Surface pressure minus the location's ERA5-cell mean: a precomputed row['pressure_anomaly'] if present,
+    otherwise atmospheric_pressure minus the mean of the cell holding row's latitude/longitude."""
+    def _get(k):
+        v = row.get(k) if hasattr(row, "get") else None
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return float("nan")
+    a = _get('pressure_anomaly')
+    if math.isfinite(a):
+        return a
+    p, lat, lon = _get('atmospheric_pressure'), _get('latitude'), _get('longitude')
+    if not (math.isfinite(p) and math.isfinite(lat) and math.isfinite(lon)):
+        return float("nan")
+    return p - era5_cell_pressure_mean(lat, lon)
+
+
+def predict_ori(row, coeffs, *, use_wind_filter=True, wind_penalty=0.25, wind_boost=1.0, use_distance_decay=False, distance_decay_rate=0.0, use_continuous_alignment=False, apply_pressure_transfer=True):
+    # Refuse missing inputs. A NaN used to propagate into z, which the clamp below turned into
+    # z = +60, i.e. a silent 100% forecast (found 2026-10-06: Jan-Jun 2024 had no BLH).
+    _required = ("temperature", "temperature_squared", "solar_radiation", "relative_humidity", "wind_speed",
+                 "precipitation", "diurnal_temperature_range", "boundary_layer_height", "atmospheric_pressure")
+    _bad = []
+    for _k in _required:
+        if _k not in coeffs:
+            continue
+        _v = row.get(_k) if hasattr(row, "get") else None
+        try:
+            _ok = _v is not None and math.isfinite(float(_v))
+        except (TypeError, ValueError):
+            _ok = False
+        if not _ok:
+            _bad.append(_k)
+    if 'pressure_anomaly' in coeffs:
+        anomaly = pressure_anomaly(row)
+        if not math.isfinite(anomaly):
+            raise ValueError("predict_ori: missing or non-finite pressure anomaly; refusing to score")
+    if _bad:
+        raise ValueError(f"predict_ori: missing or non-finite weather inputs {_bad}; refusing to score")
+    # Pressure elevation offset expresses Calvert pressure in Pittsburgh's training
+    # frame. It is the ONLY difference between an "Exact" model (transfer off) and its
+    # "Transfer" twin (transfer on); every other input is normalized identically.
+    # The refit has no atmospheric_pressure term: it uses the cell-mean anomaly instead.
+    pressure_offset = PRESSURE_ELEVATION_OFFSET if apply_pressure_transfer else 0.0
+    z = (
+        coeffs['const'] +
+        coeffs['temperature'] * row['temperature'] +
+        coeffs['temperature_squared'] * row['temperature_squared'] +
+        coeffs['solar_radiation'] * row['solar_radiation'] +
+        coeffs['relative_humidity'] * row['relative_humidity'] +
+        coeffs['wind_speed'] * row['wind_speed'] +
+        coeffs['precipitation'] * row['precipitation'] +
+        coeffs['diurnal_temperature_range'] * row['diurnal_temperature_range'] +
+        coeffs['boundary_layer_height'] * row['boundary_layer_height']
+    )
+    if 'atmospheric_pressure' in coeffs:
+        z += coeffs['atmospheric_pressure'] * (row['atmospheric_pressure'] - pressure_offset)
+    if 'pressure_anomaly' in coeffs:
+        z += coeffs['pressure_anomaly'] * anomaly
+    if use_wind_filter:
+        if use_continuous_alignment and 'wind_alignment' in row:
+            # Continuous: interpolate between penalty and boost based on alignment
+            alignment = float(row['wind_alignment'])
+            effective_mult = wind_penalty + (wind_boost - wind_penalty) * alignment
+            z += math.log(max(effective_mult, 1e-9))
+        else:
+            # Original discrete sector logic
+            loc_val = row.get('location', row.get('bearing_from_source', 196.3))
+            is_aligned = check_wind_alignment(row['wind_direction'], loc_val)
+            if not is_aligned:
+                z += math.log(max(wind_penalty, 1e-9))
+            else:
+                z += math.log(max(wind_boost, 1e-9))
+    if use_distance_decay:
+        dist = row.get('distance_from_source', None)
+        if dist is None and 'latitude' in row and 'longitude' in row:
+            dist = calculate_distance(row['latitude'], row['longitude'])
+        if dist is not None:
+            z -= distance_decay_rate * dist
+
+    # Integrated proximity regression terms (present only in COEFFS_PITTSBURGH_PROXIMITY).
+    # Prefer the precomputed multi-source aggregates (mse = nearest-source exposure
+    # max exp(-k·d_i), msa = that source's alignment); fall back to single-source Calvert.
+    if 'multi_source_exposure' in coeffs:
+        exposure = row.get('mse', None)
+        if exposure is None:
+            dist = row.get('distance_from_source', None)
+            if dist is None and 'latitude' in row and 'longitude' in row:
+                dist = calculate_distance(row['latitude'], row['longitude'])
+            exposure = math.exp(-SOURCE_DECAY_K * dist) if dist is not None else None
+        if exposure is not None:
+            z += coeffs['multi_source_exposure'] * exposure
+
+    if 'wind_align_weighted' in coeffs:
+        wind_align = row.get('msa', row.get('wind_alignment', None))
+        if wind_align is None:
+            bearing = row.get('bearing_from_source',
+                               calculate_bearing(row.get('latitude', IND_LAT),
+                                                 row.get('longitude', IND_LON)))
+            wind_align = compute_continuous_wind_alignment(
+                row.get('wind_direction', 0.0), bearing)
+        z += coeffs['wind_align_weighted'] * float(wind_align)
+
+    z = max(-60.0, min(60.0, z))
+    return round(100.0 / (1.0 + math.exp(-z)), 1)
+
+
+def fetch_forecasts(locations):
+    lats = [str(loc["coords"][0]) for loc in locations.values()]
+    lons = [str(loc["coords"][1]) for loc in locations.values()]
+    lat_param = ",".join(lats)
+    lon_param = ",".join(lons)
+    elev_param = _elevation_param(locations)  # outside the try: an unknown cell must fail loudly, not go mock
+
+    url = (
+        f"https://api.open-meteo.com/v1/forecast?"
+        f"latitude={lat_param}&longitude={lon_param}&elevation={elev_param}"
+        f"&hourly=temperature_2m,relative_humidity_2m,surface_pressure,wind_speed_10m,"
+        f"wind_direction_10m,rain,shortwave_radiation,sunshine_duration,boundary_layer_height"
+        f"&temperature_unit=fahrenheit&wind_speed_unit=mph&precipitation_unit=inch"
+        f"&past_days=1&forecast_days={FORECAST_DAYS + 1}&models={FORECAST_MODEL}&timezone=GMT"
+    )
+
+    try:
+        res_data = fetch_open_meteo_json(url)
+
+        # Open-Meteo returns a list of dictionaries if multiple coordinates are requested
+        forecast_list = res_data if isinstance(res_data, list) else [res_data]
+
+        all_daily_records = []
+
+        for idx, (loc_name, loc_info) in enumerate(locations.items()):
+            loc_data = forecast_list[idx]
+            hourly = loc_data.get("hourly", {})
+            df_hourly = pd.DataFrame(hourly)
+            df_hourly = _to_local(df_hourly)
+
+            # PBLH -> feet, UNIT-AWARE. Open-Meteo returns BLH in FEET when precipitation_unit=inch
+            # selects the imperial length system, and in METERS otherwise. Convert only from meters
+            # so the feature always lands on the training scale (ERA5 m x 3.28084 = ft) and is never
+            # double-converted. (This line previously always x3.28084, double-converting the
+            # already-feet value ~3.3x - inconsistent with backfill_blh_era5.py, which trained on
+            # ERA5 meters converted to feet exactly once.)
+            if 'boundary_layer_height' in df_hourly.columns:
+                _blh_unit = str(loc_data.get('hourly_units', {}).get('boundary_layer_height', 'm')).lower()
+                _blh_factor = 3.28084 if _blh_unit.startswith('m') else 1.0
+                df_hourly['boundary_layer_height_ft'] = df_hourly['boundary_layer_height'] * _blh_factor
+            else:
+                # No BLH in the response: leave it missing so the day gets no forecast (no fill-in value).
+                df_hourly['boundary_layer_height_ft'] = np.nan
+
+            # Speed-weighted vector mean for wind direction - arithmetic mean of degrees
+            # is invalid across the 0°/360° wrap (e.g. 350° and 10° average to 0°, not 180°).
+            df_hourly['wind_u'] = df_hourly['wind_speed_10m'] * np.sin(np.radians(df_hourly['wind_direction_10m']))
+            df_hourly['wind_v'] = df_hourly['wind_speed_10m'] * np.cos(np.radians(df_hourly['wind_direction_10m']))
+
+            daily_df = df_hourly.groupby('date').agg({
+                'temperature_2m': ['mean', 'min', 'max'],
+                'rain': 'sum',
+                'wind_speed_10m': 'mean',
+                'wind_u': 'mean',
+                'wind_v': 'mean',
+                'relative_humidity_2m': 'mean',
+                'surface_pressure': 'mean',
+                'sunshine_duration': 'sum',
+                'shortwave_radiation': 'mean',
+                'boundary_layer_height_ft': 'mean'
+            }).reset_index()
+
+            daily_df.columns = [
+                'date', 'temperature', 'temp_min', 'temp_max',
+                'precipitation', 'wind_speed', 'wind_u', 'wind_v',
+                'relative_humidity', 'atmospheric_pressure',
+                'sunshine_duration', 'solar_radiation', 'boundary_layer_height'
+            ]
+            daily_df = _blank_short_days(daily_df, df_hourly, DAILY_SOURCES)
+            daily_df['wind_direction'] = np.degrees(np.arctan2(daily_df['wind_u'], daily_df['wind_v'])) % 360
+            daily_df.drop(columns=['wind_u', 'wind_v'], inplace=True)
+
+            daily_df['diurnal_temperature_range'] = daily_df['temp_max'] - daily_df['temp_min']
+            daily_df['temperature_squared'] = daily_df['temperature'] ** 2
+            daily_df['location'] = loc_name
+            daily_df['latitude'] = loc_info["coords"][0]
+            daily_df['longitude'] = loc_info["coords"][1]
+            daily_df['bearing_from_source'] = calculate_bearing(loc_info["coords"][0], loc_info["coords"][1])
+            daily_df['distance_from_source'] = calculate_distance(loc_info["coords"][0], loc_info["coords"][1])
+            bearing_val = daily_df['bearing_from_source'].iloc[0]
+            daily_df['wind_alignment'] = daily_df.apply(
+                lambda r: compute_continuous_wind_alignment(r['wind_direction'], bearing_val), axis=1
+            )
+
+            all_daily_records.append(daily_df)
+
+        combined_df = pd.concat(all_daily_records, ignore_index=True)
+        today = _local_today()
+        keep = (combined_df['date'] >= today) & (combined_df['date'] < _shift_days(today, FORECAST_DAYS))
+        return combined_df[keep].reset_index(drop=True), False
+
+    except Exception as exc:
+        _report_fetch_failure("fetch_forecasts", exc)
+        # Build clean simulated fallback dataframe
+        dates = [(datetime.date.today() + datetime.timedelta(days=i)).strftime('%Y-%m-%d') for i in range(FORECAST_DAYS)]
+        fallback_records = []
+        for loc_name, loc_info in locations.items():
+            state_seed = int(hashlib.md5(loc_name.encode()).hexdigest()[:8], 16) % 10000
+            np.random.seed(state_seed)
+            temps = np.random.uniform(65.0, 85.0, FORECAST_DAYS)
+            dtrs = np.random.uniform(10.0, 22.0, FORECAST_DAYS)
+            winds = np.random.uniform(1.5, 7.5, FORECAST_DAYS)
+            wind_dirs = np.random.uniform(0, 360, FORECAST_DAYS)
+            rh = np.random.uniform(50.0, 85.0, FORECAST_DAYS)
+            press = np.random.uniform(1008.0, 1018.0, FORECAST_DAYS)
+            sun_dur = np.random.uniform(20000.0, 40000.0, FORECAST_DAYS)
+            rad = np.random.uniform(100.0, 300.0, FORECAST_DAYS)
+            blh = np.random.choice([600.0, 1200.0, 2000.0], size=FORECAST_DAYS, p=[0.2, 0.5, 0.3])
+            rain = np.random.choice([0.0, 0.1, 0.3], size=FORECAST_DAYS, p=[0.7, 0.2, 0.1])
+
+            mock_data = {
+                'date': dates,
+                'temperature': temps,
+                'temp_min': temps - dtrs / 2.0,
+                'temp_max': temps + dtrs / 2.0,
+                'precipitation': rain,
+                'wind_speed': winds,
+                'wind_direction': wind_dirs,
+                'relative_humidity': rh,
+                'atmospheric_pressure': press,
+                'sunshine_duration': sun_dur,
+                'solar_radiation': rad,
+                'boundary_layer_height': blh
+            }
+            df_m = pd.DataFrame(mock_data)
+            df_m['diurnal_temperature_range'] = df_m['temp_max'] - df_m['temp_min']
+            df_m['temperature_squared'] = df_m['temperature'] ** 2
+            df_m['location'] = loc_name
+            df_m['latitude'] = loc_info["coords"][0]
+            df_m['longitude'] = loc_info["coords"][1]
+            df_m['bearing_from_source'] = calculate_bearing(loc_info["coords"][0], loc_info["coords"][1])
+            fallback_records.append(df_m)
+
+        return pd.concat(fallback_records, ignore_index=True), True
+
+
+def _apply_daily_aggregates_to_hourly(df, bearing, loc_name):
+    """Compute raw-hourly wind alignment and add daily-aggregate companion columns.
+
+    Raw hourly fields (solar_radiation, precipitation, relative_humidity,
+    atmospheric_pressure, wind_speed, wind_direction) are preserved as-is - the
+    fitted hourly model reads them directly.  A parallel set of *_daily columns
+    (solar_radiation_daily, precipitation_daily, relative_humidity_daily,
+    atmospheric_pressure_daily, wind_speed_daily, wind_direction_daily,
+    wind_alignment_daily, aligned_daily) holds the per-date aggregates needed by
+    the daily-constant-input (frankenstein) fallback view.  Temperature and BLH
+    are genuinely sub-daily and have no *_daily counterpart.
+    """
+    df = df.copy()
+    # Raw hourly wind alignment (used by the fitted hourly model)
+    df['wind_alignment'] = df['wind_direction'].apply(
+        lambda wd: compute_continuous_wind_alignment(wd, bearing)
+    )
+    df['aligned'] = df['wind_direction'].apply(
+        lambda wd: check_wind_alignment(wd, loc_name)
+    )
+    # Build daily aggregates for the frankenstein fallback
+    df['_wu'] = np.cos(np.radians(df['wind_direction']))
+    df['_wv'] = np.sin(np.radians(df['wind_direction']))
+    day_agg = df.groupby('date').agg(
+        solar_radiation_daily=('solar_radiation', 'mean'),
+        precipitation_daily=('precipitation', 'sum'),
+        relative_humidity_daily=('relative_humidity', 'mean'),
+        atmospheric_pressure_daily=('atmospheric_pressure', 'mean'),
+        wind_speed_daily=('wind_speed', 'mean'),
+        _wu_d=('_wu', 'mean'),
+        _wv_d=('_wv', 'mean'),
+    ).reset_index()
+    day_agg['wind_direction_daily'] = (
+        np.degrees(np.arctan2(day_agg['_wv_d'], day_agg['_wu_d'])) % 360
+    )
+    df = df.merge(
+        day_agg[['date', 'solar_radiation_daily', 'precipitation_daily',
+                 'relative_humidity_daily', 'atmospheric_pressure_daily',
+                 'wind_speed_daily', 'wind_direction_daily']],
+        on='date',
+    )
+    df['wind_alignment_daily'] = df['wind_direction_daily'].apply(
+        lambda wd: compute_continuous_wind_alignment(wd, bearing)
+    )
+    df['aligned_daily'] = df['wind_direction_daily'].apply(
+        lambda wd: check_wind_alignment(wd, loc_name)
+    )
+    df.drop(columns=['_wu', '_wv'], inplace=True)
+    return df
+
+
+HOURLY_INPUT_COLS = ['temperature', 'relative_humidity', 'atmospheric_pressure', 'wind_speed', 'wind_direction',
+                     'precipitation', 'solar_radiation', 'boundary_layer_height']
+HOURLY_DAILY_COLS = ['solar_radiation_daily', 'precipitation_daily', 'relative_humidity_daily',
+                     'atmospheric_pressure_daily', 'wind_speed_daily', 'wind_direction_daily', 'wind_alignment_daily']
+
+
+def fetch_hourly_forecasts(locations):
+    """Return (df, is_mock) of per-hour rows for all locations over FORECAST_DAYS forecast days.
+
+    Each row carries the same feature schema as daily feature cells - temp,
+    solar, rh, wind_speed/dir, precip, blh, pressure, dtr (parent-day max−min),
+    wind_alignment, aligned - plus datetime, date, hour, loc_id, and distance.
+    DTR is computed as daily max−min temperature and attached to all 24 hours of
+    each day so the existing ORI math (which expects dtr) works unchanged.
+    """
+    lats = [str(loc["coords"][0]) for loc in locations.values()]
+    lons = [str(loc["coords"][1]) for loc in locations.values()]
+    lat_param = ",".join(lats)
+    lon_param = ",".join(lons)
+    elev_param = _elevation_param(locations)  # outside the try: an unknown cell must fail loudly, not go mock
+
+    url = (
+        f"https://api.open-meteo.com/v1/forecast?"
+        f"latitude={lat_param}&longitude={lon_param}&elevation={elev_param}"
+        f"&hourly=temperature_2m,relative_humidity_2m,surface_pressure,wind_speed_10m,"
+        f"wind_direction_10m,rain,shortwave_radiation,boundary_layer_height"
+        f"&temperature_unit=fahrenheit&wind_speed_unit=mph&precipitation_unit=inch"
+        f"&past_days=1&forecast_days={FORECAST_DAYS + 1}&models={FORECAST_MODEL}&timezone=GMT"
+    )
+
+    try:
+        res_data = fetch_open_meteo_json(url)
+        forecast_list = res_data if isinstance(res_data, list) else [res_data]
+
+        all_rows = []
+        for idx, (loc_name, loc_info) in enumerate(locations.items()):
+            loc_data = forecast_list[idx]
+            hourly = loc_data.get("hourly", {})
+            df = pd.DataFrame(hourly)
+            df = _to_local(df)
+            df['datetime'] = df['time'].dt.strftime('%Y-%m-%dT%H:%M')  # 01:00 occurs twice on the fall-back day
+            df['hour'] = df['time'].dt.hour
+
+            # BLH -> feet, UNIT-AWARE (see fetch_forecasts): Open-Meteo returns feet when
+            # precipitation_unit=inch is set, meters otherwise. Convert only from meters so the
+            # value is never double-converted and matches the training scale.
+            if 'boundary_layer_height' in df.columns:
+                _blh_unit = str(loc_data.get('hourly_units', {}).get('boundary_layer_height', 'm')).lower()
+                _blh_factor = 3.28084 if _blh_unit.startswith('m') else 1.0
+                df['boundary_layer_height'] = df['boundary_layer_height'] * _blh_factor
+            else:
+                # No BLH in the response: leave it missing so the hour gets no forecast (no fill-in value).
+                df['boundary_layer_height'] = np.nan
+
+            # Parent-day DTR: daily max−min temperature, merged to all 24 hours
+            daily_dtr = (
+                df.groupby('date')['temperature_2m']
+                  .agg(lambda s: float(s.max() - s.min()))
+                  .rename('dtr')
+                  .reset_index()
+            )
+            df = df.merge(daily_dtr, on='date')
+
+            # Rename to match cell schema used by predict_ori / model.js
+            df = df.rename(columns={
+                'temperature_2m':      'temperature',
+                'relative_humidity_2m':'relative_humidity',
+                'surface_pressure':    'atmospheric_pressure',
+                'wind_speed_10m':      'wind_speed',
+                'wind_direction_10m':  'wind_direction',
+                'rain':                'precipitation',
+                'shortwave_radiation': 'solar_radiation',
+            })
+            df['temperature_squared'] = df['temperature'] ** 2
+
+            # Spatial constants for this tract
+            lat, lon = loc_info["coords"]
+            bearing  = calculate_bearing(lat, lon)
+            distance = calculate_distance(lat, lon)
+            parts    = loc_name.split(" ", 2)
+            loc_id   = parts[1] if len(parts) > 1 else loc_name
+
+            df['loc_id']              = loc_id
+            df['location']            = loc_name
+            df['distance_from_source'] = distance
+            df['bearing_from_source'] = bearing
+            df = _apply_daily_aggregates_to_hourly(df, bearing, loc_name)
+            # On a day missing any hour of an input, blank the daily companions so the site leaves its hours out
+            short = set().union(*(_short_days(df, c) for c in HOURLY_INPUT_COLS))
+            df.loc[df['date'].isin(short), ['dtr'] + HOURLY_DAILY_COLS] = np.nan
+
+            all_rows.append(df[[
+                'datetime', 'date', 'hour', 'loc_id', 'location',
+                'temperature', 'temperature_squared', 'solar_radiation',
+                'relative_humidity', 'wind_speed', 'wind_direction', 'precipitation',
+                'dtr', 'boundary_layer_height', 'atmospheric_pressure',
+                'distance_from_source', 'bearing_from_source', 'wind_alignment', 'aligned',
+                # Daily-aggregate counterparts for the frankenstein fallback view
+                'solar_radiation_daily', 'precipitation_daily', 'relative_humidity_daily',
+                'atmospheric_pressure_daily', 'wind_speed_daily', 'wind_direction_daily',
+                'wind_alignment_daily', 'aligned_daily',
+            ]])
+
+        out = pd.concat(all_rows, ignore_index=True)
+        today = _local_today()
+        keep = (out['date'] >= today) & (out['date'] < _shift_days(today, FORECAST_DAYS))
+        return out[keep].reset_index(drop=True), False
+
+    except Exception as exc:
+        _report_fetch_failure("fetch_hourly_forecasts", exc)
+        # Synthetic mock: plausible diurnal cycles per location/day
+        today = datetime.date.today()
+        all_rows = []
+        for loc_name, loc_info in locations.items():
+            seed = int(hashlib.md5(loc_name.encode()).hexdigest()[:8], 16) % 10000
+            rng = np.random.RandomState(seed)
+
+            day_temps  = rng.uniform(65.0, 88.0, FORECAST_DAYS)
+            day_dtrs   = rng.uniform(10.0, 22.0, FORECAST_DAYS)
+            day_rh     = rng.uniform(50.0, 82.0, FORECAST_DAYS)
+            day_press  = rng.uniform(1008.0, 1018.0, FORECAST_DAYS)
+            day_winds  = rng.uniform(1.5, 7.5, FORECAST_DAYS)
+            day_wdirs  = rng.uniform(0, 360, FORECAST_DAYS)
+            day_blh    = rng.choice([400.0, 900.0, 1800.0, 3000.0], size=FORECAST_DAYS,
+                                    p=[0.15, 0.30, 0.40, 0.15])
+            day_rain   = rng.choice([0.0, 0.01, 0.05], size=FORECAST_DAYS, p=[0.70, 0.20, 0.10])
+
+            lat, lon  = loc_info["coords"]
+            bearing   = calculate_bearing(lat, lon)
+            distance  = calculate_distance(lat, lon)
+            parts     = loc_name.split(" ", 2)
+            loc_id    = parts[1] if len(parts) > 1 else loc_name
+
+            rows = []
+            for day_i in range(FORECAST_DAYS):
+                d_str  = (today + datetime.timedelta(days=day_i)).strftime('%Y-%m-%d')
+                t_mean = float(day_temps[day_i])
+                dtr    = float(day_dtrs[day_i])
+                for h in range(24):
+                    # Temperature: min ~6am, max ~3pm
+                    phase = (h - 6) / 24.0 * 2 * math.pi - math.pi / 2
+                    temp  = t_mean + (dtr / 2.0) * math.sin(phase)
+                    # Solar: 0 at night, bell curve peaking at noon
+                    solar = (max(0.0, 620.0 * math.sin(math.pi * (h - 6) / 14.0))
+                             if 6 <= h <= 20 else 0.0)
+                    # BLH: low overnight, peaks mid-afternoon
+                    blh_frac   = (max(0.08, math.sin(math.pi * (h - 7) / 14.0))
+                                  if 7 <= h <= 21 else 0.08)
+                    blh        = float(day_blh[day_i]) * blh_frac
+                    wind_speed = float(day_winds[day_i]) * (0.65 + 0.35 * blh_frac)
+                    wind_dir   = (float(day_wdirs[day_i]) + float(rng.uniform(-20.0, 20.0))) % 360.0
+                    rh_h       = float(day_rh[day_i]) + (4.0 if h < 9 or h > 20 else -2.0)
+                    precip_h   = float(day_rain[day_i]) / 24.0
+                    rows.append({
+                        'datetime': f"{d_str}T{h:02d}:00",
+                        'date': d_str, 'hour': h,
+                        'loc_id': loc_id, 'location': loc_name,
+                        'temperature': temp,
+                        'temperature_squared': temp ** 2,
+                        'solar_radiation': solar,
+                        'relative_humidity': rh_h,
+                        'wind_speed': wind_speed,
+                        'wind_direction': wind_dir,
+                        'precipitation': precip_h,
+                        'dtr': dtr,
+                        'boundary_layer_height': blh,
+                        'atmospheric_pressure': float(day_press[day_i]),
+                        'distance_from_source': distance,
+                        'bearing_from_source': bearing,
+                    })
+            loc_df = pd.DataFrame(rows)
+            loc_df = _apply_daily_aggregates_to_hourly(loc_df, bearing, loc_name)
+            all_rows.append(loc_df)
+
+        return pd.concat(all_rows, ignore_index=True), True
+
+
+def fetch_historical_weather(locations):
+    # Use the forecast endpoint with past_days instead of the archive (ERA5) API.
+    # The ERA5 archive lags ~5 days, leaving the most recent calendar cells blank.
+    # The forecast endpoint's past_days parameter returns blended NWP reanalysis with
+    # no lag, ensuring the most recent days in the calendar are always populated.
+    lats = [str(loc["coords"][0]) for loc in locations.values()]
+    lons = [str(loc["coords"][1]) for loc in locations.values()]
+    lat_param = ",".join(lats)
+    lon_param = ",".join(lons)
+    elev_param = _elevation_param(locations)  # outside the try: an unknown cell must fail loudly, not go mock
+
+    url = (
+        f"https://api.open-meteo.com/v1/forecast?"
+        f"latitude={lat_param}&longitude={lon_param}&elevation={elev_param}"
+        f"&hourly=temperature_2m,relative_humidity_2m,surface_pressure,wind_speed_10m,"
+        f"wind_direction_10m,rain,shortwave_radiation,boundary_layer_height"
+        f"&temperature_unit=fahrenheit&wind_speed_unit=mph&precipitation_unit=inch"
+        f"&past_days=31&forecast_days=2&models={FORECAST_MODEL}&timezone=GMT"
+    )
+
+    try:
+        res_data = fetch_open_meteo_json(url)
+
+        # Open-Meteo returns a list of dictionaries if multiple coordinates are requested
+        forecast_list = res_data if isinstance(res_data, list) else [res_data]
+
+        all_daily_records = []
+
+        for idx, (loc_name, loc_info) in enumerate(locations.items()):
+            loc_data = forecast_list[idx]
+            hourly = loc_data.get("hourly", {})
+            df_hourly = pd.DataFrame(hourly)
+            df_hourly = _to_local(df_hourly)
+
+            # PBLH -> feet, UNIT-AWARE. Open-Meteo returns BLH in FEET when precipitation_unit=inch
+            # selects the imperial length system, and in METERS otherwise. Convert only from meters
+            # so the feature always lands on the training scale (ERA5 m x 3.28084 = ft) and is never
+            # double-converted. (This line previously always x3.28084, double-converting the
+            # already-feet value ~3.3x - inconsistent with backfill_blh_era5.py, which trained on
+            # ERA5 meters converted to feet exactly once.)
+            if 'boundary_layer_height' in df_hourly.columns:
+                _blh_unit = str(loc_data.get('hourly_units', {}).get('boundary_layer_height', 'm')).lower()
+                _blh_factor = 3.28084 if _blh_unit.startswith('m') else 1.0
+                df_hourly['boundary_layer_height_ft'] = df_hourly['boundary_layer_height'] * _blh_factor
+            else:
+                # No BLH in the response: leave it missing so the day gets no forecast (no fill-in value).
+                df_hourly['boundary_layer_height_ft'] = np.nan
+
+            # Speed-weighted vector mean for wind direction - arithmetic mean of degrees
+            # is invalid across the 0°/360° wrap (e.g. 350° and 10° average to 0°, not 180°).
+            df_hourly['wind_u'] = df_hourly['wind_speed_10m'] * np.sin(np.radians(df_hourly['wind_direction_10m']))
+            df_hourly['wind_v'] = df_hourly['wind_speed_10m'] * np.cos(np.radians(df_hourly['wind_direction_10m']))
+
+            daily_df = df_hourly.groupby('date').agg({
+                'temperature_2m': ['mean', 'min', 'max'],
+                'rain': 'sum',
+                'wind_speed_10m': 'mean',
+                'wind_u': 'mean',
+                'wind_v': 'mean',
+                'relative_humidity_2m': 'mean',
+                'surface_pressure': 'mean',
+                'shortwave_radiation': 'mean',
+                'boundary_layer_height_ft': 'mean'
+            }).reset_index()
+
+            daily_df.columns = [
+                'date', 'temperature', 'temp_min', 'temp_max',
+                'precipitation', 'wind_speed', 'wind_u', 'wind_v',
+                'relative_humidity', 'atmospheric_pressure',
+                'solar_radiation', 'boundary_layer_height'
+            ]
+            daily_df = _blank_short_days(daily_df, df_hourly, DAILY_SOURCES)
+            daily_df['wind_direction'] = np.degrees(np.arctan2(daily_df['wind_u'], daily_df['wind_v'])) % 360
+            daily_df.drop(columns=['wind_u', 'wind_v'], inplace=True)
+
+            daily_df['diurnal_temperature_range'] = daily_df['temp_max'] - daily_df['temp_min']
+            daily_df['temperature_squared'] = daily_df['temperature'] ** 2
+            daily_df['location'] = loc_name
+            daily_df['latitude'] = loc_info["coords"][0]
+            daily_df['longitude'] = loc_info["coords"][1]
+            daily_df['bearing_from_source'] = calculate_bearing(loc_info["coords"][0], loc_info["coords"][1])
+            daily_df['distance_from_source'] = calculate_distance(loc_info["coords"][0], loc_info["coords"][1])
+            bearing_val = daily_df['bearing_from_source'].iloc[0]
+            daily_df['wind_alignment'] = daily_df.apply(
+                lambda r: compute_continuous_wind_alignment(r['wind_direction'], bearing_val), axis=1
+            )
+
+            all_daily_records.append(daily_df)
+
+        combined_df = pd.concat(all_daily_records, ignore_index=True)
+        # Keep the last 31 local days and today (the UTC window also holds part of the day before and tomorrow)
+        today = _local_today()
+        combined_df = combined_df[(combined_df['date'] >= _shift_days(today, -31)) & (combined_df['date'] <= today)].copy()
+        return combined_df, False
+
+    except Exception as exc:
+        _report_fetch_failure("fetch_historical_weather", exc)
+        today = datetime.date.today()
+        # Build clean simulated fallback dataframe
+        dates = [(today - datetime.timedelta(days=i)).strftime('%Y-%m-%d') for i in range(1, 31)]
+        dates.reverse()
+        fallback_records = []
+        for loc_name, loc_info in locations.items():
+            state_seed = int(hashlib.md5(loc_name.encode()).hexdigest()[:8], 16) % 10000
+            np.random.seed(state_seed)
+            temps = np.random.uniform(65.0, 85.0, 30)
+            dtrs = np.random.uniform(10.0, 22.0, 30)
+            winds = np.random.uniform(0.5, 6.0, 30)
+            wind_dirs = np.random.uniform(0, 360, 30)
+            rh = np.random.uniform(50.0, 85.0, 30)
+            press = np.random.uniform(1008.0, 1018.0, 30)
+            rad = np.random.uniform(100.0, 300.0, 30)
+            blh = np.random.choice([400.0, 800.0, 1500.0, 2500.0], size=30, p=[0.15, 0.25, 0.40, 0.20])
+            rain = np.random.choice([0.0, 0.05, 0.2], size=30, p=[0.75, 0.15, 0.10])
+
+            mock_data = {
+                'date': dates,
+                'temperature': temps,
+                'temp_min': temps - dtrs / 2.0,
+                'temp_max': temps + dtrs / 2.0,
+                'precipitation': rain,
+                'wind_speed': winds,
+                'wind_direction': wind_dirs,
+                'relative_humidity': rh,
+                'atmospheric_pressure': press,
+                'solar_radiation': rad,
+                'boundary_layer_height': blh
+            }
+            df_m = pd.DataFrame(mock_data)
+            df_m['diurnal_temperature_range'] = df_m['temp_max'] - df_m['temp_min']
+            df_m['temperature_squared'] = df_m['temperature'] ** 2
+            df_m['location'] = loc_name
+            df_m['latitude'] = loc_info["coords"][0]
+            df_m['longitude'] = loc_info["coords"][1]
+            df_m['bearing_from_source'] = calculate_bearing(loc_info["coords"][0], loc_info["coords"][1])
+            fallback_records.append(df_m)
+
+        return pd.concat(fallback_records, ignore_index=True), True
